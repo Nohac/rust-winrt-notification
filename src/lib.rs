@@ -20,6 +20,8 @@
 //!
 //! * Windows 8.1 only supports a single image, the last image (icon, hero, image) will be the one on the toast
 
+use windows::core::Interface;
+use windows::UI::Notifications::ToastActivatedEventArgs;
 /// for xml schema details check out:
 ///
 /// * https://docs.microsoft.com/en-us/uwp/schemas/tiles/toastschema/root-elements
@@ -37,12 +39,15 @@ use windows::{
     UI::Notifications::ToastNotificationManager,
 };
 
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::Path;
 use std::str::FromStr;
 
 pub use windows::core::{Error, Result, HSTRING};
-pub use windows::UI::Notifications::ToastNotification;
+pub use windows::UI::Notifications::{
+    ToastDismissedEventArgs, ToastFailedEventArgs, ToastNotification,
+};
 
 pub struct Toast {
     duration: String,
@@ -53,7 +58,20 @@ pub struct Toast {
     audio: String,
     app_id: String,
     scenario: String,
+    inputs: String,
+    actions: String,
     on_activated: Option<TypedEventHandler<ToastNotification, IInspectable>>,
+}
+
+type ToastHandler<Inner> =
+    Option<Box<dyn FnMut(&Option<ToastNotification>, &Option<Inner>) -> Result<()> + Send>>;
+
+/// Wrapper for [`Toast`] to add handlers for the different events
+pub struct ToastWithHandlers {
+    toast: Toast,
+    activate_handler: ToastHandler<IInspectable>,
+    dismiss_handler: ToastHandler<ToastDismissedEventArgs>,
+    fail_handler: ToastHandler<ToastFailedEventArgs>,
 }
 
 #[derive(Clone, Copy)]
@@ -242,6 +260,79 @@ pub enum Scenario {
     IncomingCall,
 }
 
+/// Specifies the id and text of a selection item.
+///
+/// See <https://docs.microsoft.com/en-us/uwp/schemas/tiles/toastschema/element-selection>
+#[derive(Debug, Clone)]
+pub struct SelectionItem {
+    /// The id of the selection item. If no id is given the content will be used instead.
+    pub id: Option<String>,
+    /// The content of the selection item.
+    pub content: String,
+}
+
+impl SelectionItem {
+    /// Create a [`SelectionItem`] with `id` set to `content`
+    pub fn from_content<S: ToString>(content: S) -> Self {
+        Self {
+            id: None,
+            content: content.to_string(),
+        }
+    }
+}
+
+/// Specifies an input, either text box or selection menu, shown in a toast notification.
+///
+/// See <https://docs.microsoft.com/en-us/uwp/schemas/tiles/toastschema/element-input>
+#[derive(Debug, Clone)]
+pub enum InputType {
+    /// Placeholder of the text.
+    Text(Option<String>),
+    /// The contents of the selection items.
+    Selection(Vec<SelectionItem>),
+}
+
+impl InputType {
+    pub fn text_with_placeholder<S: ToString>(placeholder: S) -> Self {
+        Self::Text(Some(placeholder.to_string()))
+    }
+
+    pub fn from_selections<I: IntoIterator<Item = SelectionItem>>(iter: I) -> Self {
+        Self::Selection(iter.into_iter().collect())
+    }
+
+    /// See [`SelectionItem::from_content`]
+    pub fn from_selection_contents<S: ToString, I: IntoIterator<Item = S>>(iter: I) -> Self {
+        Self::from_selections(iter.into_iter().map(SelectionItem::from_content))
+    }
+}
+
+/// Specifies a button shown in a toast.
+///
+/// See <https://docs.microsoft.com/en-us/uwp/schemas/tiles/toastschema/element-action>
+#[derive(Debug, Clone, Default)]
+pub struct Action {
+    /// The content displayed on the button.
+    pub content: String,
+    /// App-defined string of arguments that the app will later receive if the user clicks this button.
+    /// Can be used to get the value in [`ActivatedEventArgs::get_user_input`].
+    pub arguments: String,
+    /// When set the action becomes a context menu action added to the toast notification's context menu rather than a traditional toast button.
+    pub place_to_context_menu: bool,
+}
+
+impl Action {
+    /// Create an [`Action`] and set `arguments` to `content`
+    pub fn from_content<S: ToString>(content: S) -> Self {
+        let content = content.to_string();
+        Self {
+            arguments: content.clone(),
+            content,
+            place_to_context_menu: false,
+        }
+    }
+}
+
 impl Toast {
     /// This can be used if you do not have a AppUserModelID.
     ///
@@ -266,6 +357,8 @@ impl Toast {
             audio: String::new(),
             app_id: app_id.to_string(),
             scenario: String::new(),
+            inputs: String::new(),
+            actions: String::new(),
             on_activated: None,
         }
     }
@@ -392,6 +485,71 @@ impl Toast {
         self
     }
 
+    /// Add an input to the toast
+    ///
+    /// May be done up to 5 times
+    /// The `id` can be used to get the value in [`ActivatedEventArgs::get_user_input`]
+    pub fn input(mut self, ty: InputType, id: &str) -> Toast {
+        let (ty_attr, children, placeholder) = match ty {
+            InputType::Selection(selections) => (
+                "selection",
+                selections
+                    .into_iter()
+                    .map(|selection| {
+                        let id = selection.id.unwrap_or_else(|| selection.content.clone());
+                        format!(
+                            r#"<selection id="{}" content="{}" />"#,
+                            quick_xml::escape::escape(&id),
+                            quick_xml::escape::escape(&selection.content),
+                        )
+                    })
+                    .collect(),
+                String::new(),
+            ),
+            InputType::Text(placeholder) => (
+                "text",
+                String::new(),
+                placeholder
+                    .map(|placeholder| {
+                        format!(
+                            r#"placeHolderContent="{}""#,
+                            quick_xml::escape::escape(&placeholder)
+                        )
+                    })
+                    .unwrap_or_default(),
+            ),
+        };
+
+        self.inputs = format!(
+            r#"{}<input id="{}" type="{}" {}>{}</input>"#,
+            self.inputs,
+            quick_xml::escape::escape(id),
+            ty_attr,
+            placeholder,
+            children,
+        );
+        self
+    }
+
+    /// Add an action to the toast
+    ///
+    /// May be done up to 5 times
+    pub fn action(mut self, action: Action) -> Toast {
+        let placement = if action.place_to_context_menu {
+            r#"placement="contextMenu""#
+        } else {
+            ""
+        };
+        self.actions = format!(
+            r#"{}<action content="{}" arguments="{}" {}/>"#,
+            self.actions,
+            quick_xml::escape::escape(&action.content),
+            quick_xml::escape::escape(&action.arguments),
+            placement,
+        );
+        self
+    }
+
     /// Set the sound for the toast or silence it
     ///
     /// Default is [Sound::IM](enum.Sound.html)
@@ -444,6 +602,10 @@ impl Toast {
                         </binding>
                     </visual>
                     {}
+                    <actions>
+                        {}
+                        {}
+                    </actions>
                 </toast>",
             self.duration,
             self.scenario,
@@ -453,6 +615,8 @@ impl Toast {
             self.line1,
             self.line2,
             self.audio,
+            self.inputs,
+            self.actions,
         )))?;
 
         // Create the toast
@@ -473,6 +637,129 @@ impl Toast {
         let result = toast_notifier.Show(&toast_template);
         std::thread::sleep(std::time::Duration::from_millis(10));
         result
+    }
+}
+
+impl ToastWithHandlers {
+    pub fn new(toast: Toast) -> Self {
+        Self {
+            toast,
+            activate_handler: None,
+            dismiss_handler: None,
+            fail_handler: None,
+        }
+    }
+
+    /// Occurs when user activates a toast notification through a click or touch.
+    ///
+    /// See <https://docs.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotification.activated>
+    pub fn on_activate(
+        mut self,
+        handler: impl Fn(ActivatedEventArgs) -> Result<()> + 'static + Send,
+    ) -> Self {
+        // These explicit type names are required because of lifetime interference
+        // See https://github.com/rust-lang/rust/issues/70263
+        let handler = move |notification: &'_ Option<ToastNotification>,
+                            args: &'_ Option<IInspectable>| {
+            let event_args = ActivatedEventArgs { notification, args };
+            handler(event_args)
+        };
+        self.activate_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Occurs when a toast notification leaves the screen, either by expiring or being explicitly dismissed by the user.
+    ///
+    /// See <https://docs.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotification.dismissed>
+    pub fn on_dismiss(
+        mut self,
+        handler: impl FnMut(&Option<ToastNotification>, &Option<ToastDismissedEventArgs>) -> Result<()>
+            + 'static
+            + Send,
+    ) -> Self {
+        self.dismiss_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Occurs when an error is caused when Windows attempts to raise a toast notification.
+    ///
+    /// See <https://docs.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastnotification.failed>
+    pub fn on_fail(
+        mut self,
+        handler: impl FnMut(&Option<ToastNotification>, &Option<ToastFailedEventArgs>) -> Result<()>
+            + 'static
+            + Send,
+    ) -> Self {
+        self.fail_handler = Some(Box::new(handler));
+        self
+    }
+
+    /// Register the handlers and display the toast on the screen
+    ///
+    /// see: [`Toast::show`]
+    pub fn show(self) -> Result<()> {
+        let toast_template = self.toast.create_template()?;
+
+        // Add event handlers
+        if let Some(handler) = self.activate_handler {
+            toast_template.Activated(&TypedEventHandler::new(handler))?;
+        }
+        if let Some(handler) = self.dismiss_handler {
+            toast_template.Dismissed(&TypedEventHandler::new(handler))?;
+        }
+        if let Some(handler) = self.fail_handler {
+            toast_template.Failed(&TypedEventHandler::new(handler))?;
+        }
+
+        let toast_notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(
+            &self.toast.app_id,
+        ))?;
+
+        // Show the toast.
+        let result = toast_notifier.Show(&toast_template);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        result
+    }
+}
+
+/// Arguments received on activation
+pub struct ActivatedEventArgs<'a> {
+    /// Notification from which the event came
+    pub notification: &'a Option<ToastNotification>,
+    /// Raw value. Prefer using [`Self::get_raw_event_args`] to work with this value
+    pub args: &'a Option<IInspectable>,
+}
+
+impl<'a> ActivatedEventArgs<'a> {
+    /// Exposes a method that retrieves the arguments associated with a toast action initiated by the user.
+    /// This lets the app tell which action was taken when multiple actions were exposed.
+    ///
+    /// See <https://docs.microsoft.com/en-us/uwp/api/windows.ui.notifications.toastactivatedeventargs>
+    pub fn get_raw_event_args(&self) -> Option<Result<ToastActivatedEventArgs>> {
+        self.args.as_ref().map(Interface::cast)
+    }
+
+    /// Gets the arguments associated with a toast action initiated by the user
+    pub fn get_arguments(&self) -> Option<Result<String>> {
+        self.get_raw_event_args()
+            .map(|args| Ok(args?.Arguments()?.to_string_lossy()))
+    }
+
+    /// For toast notifications that include text boxes or selections for user input, contains the user input.
+    pub fn get_user_input(&self) -> Option<Result<HashMap<String, String>>> {
+        self.get_raw_event_args().map(|args| {
+            args?
+                .UserInput()?
+                .into_iter()
+                .map(|pair| {
+                    let key = pair.Key()?;
+                    let value: HSTRING = pair.Value()?.try_into()?;
+
+                    Ok((key.to_string_lossy(), value.to_string_lossy()))
+                })
+                .collect()
+        })
     }
 }
 
